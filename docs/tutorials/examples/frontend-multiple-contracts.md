@@ -85,3 +85,191 @@ You can aggregate multiple [actions](../../smart-contracts/anatomy/actions.md) d
   // Ask the wallet to sign and send the transaction
   await wallet.signAndSendTransactions({ transactions: [ ftTx ] })
 ```
+---
+
+## 📚 Tutorial: Multi-Contract Flow in a Real dApp
+
+In many dApps (especially DeFi), you need to:
+
+1. **Read** data from multiple contracts (balances, app state, staking info).
+2. **Perform** multiple independent transactions in one wallet prompt.
+3. **Batch** several actions into a single transaction when they target the same contract.
+
+Here’s a real-world style example.
+
+---
+
+### Step 1 — Query Multiple Contracts in Parallel
+
+```js
+const view = (contractId, method, args = {}) =>
+  wallet.viewMethod({ contractId, method, args });
+
+async function loadDashboard(accountId) {
+  const [storageBalance, storageBounds, messages] = await Promise.all([
+    view('ft.example.near', 'storage_balance_of', { account_id: accountId }),
+    view('ft.example.near', 'storage_balance_bounds'),
+    view('guest-book.testnet', 'getMessages', { from_index: 0, limit: 10 }),
+  ]);
+
+  return {
+    isRegistered: !!storageBalance,
+    storageMin: storageBounds?.min,
+    messages,
+  };
+}
+```
+
+**Why:** View calls are cheap, parallelizable, and safe, they never change blockchain state.
+
+---
+
+### Step 2 — Batch Actions for Atomic Execution
+
+If the user isn’t registered on an FT contract, register them **and** transfer tokens in one atomic transaction:
+
+```js
+const THIRTY_TGAS = '30000000000000';
+
+async function registerAndTransferFT({ receiverId, amountYocto, registerDepositYocto }) {
+  const tx = {
+    receiverId: 'ft.example.near',
+    actions: [
+      {
+        type: 'FunctionCall',
+        params: {
+          methodName: 'storage_deposit',
+          args: { account_id: receiverId },
+          gas: THIRTY_TGAS,
+          deposit: registerDepositYocto
+        },
+      },
+      {
+        type: 'FunctionCall',
+        params: {
+          methodName: 'ft_transfer',
+          args: { receiver_id: receiverId, amount: amountYocto },
+          gas: THIRTY_TGAS,
+          deposit: '1'
+        },
+      },
+    ],
+  };
+
+  return wallet.signAndSendTransactions({ transactions: [tx] });
+}
+```
+
+**Why:** All-or-nothing execution means no half-registered users without tokens.
+
+---
+
+### Step 3 — Multiple Independent Transactions in One Prompt
+
+You can send **two or more transactions** to different contracts in the same wallet flow:
+
+```js
+async function postGuestBookMessage(text) {
+  return {
+    receiverId: 'guest-book.testnet',
+    actions: [
+      {
+        type: 'FunctionCall',
+        params: {
+          methodName: 'addMessage',
+          args: { text },
+          gas: THIRTY_TGAS,
+          deposit: '10000000000000000000000'
+        },
+      },
+    ],
+  };
+}
+
+async function combinedFlow(receiverId, amountYocto, registerDepositYocto, message) {
+  const ftTx = {
+    receiverId: 'ft.example.near',
+    actions: [
+      {
+        type: 'FunctionCall',
+        params: {
+          methodName: 'storage_deposit',
+          args: { account_id: receiverId },
+          gas: THIRTY_TGAS,
+          deposit: registerDepositYocto,
+        },
+      },
+      {
+        type: 'FunctionCall',
+        params: {
+          methodName: 'ft_transfer',
+          args: { receiver_id: receiverId, amount: amountYocto },
+          gas: THIRTY_TGAS,
+          deposit: '1',
+        },
+      },
+    ],
+  };
+
+  const guestBookTx = await postGuestBookMessage(message);
+
+  return wallet.signAndSendTransactions({ transactions: [ftTx, guestBookTx] });
+}
+```
+
+**Why:** Reduces prompts for better UX.
+
+❗ **Note:** These transactions are **independent** if one fails, the other still runs.
+
+---
+
+## Rust Contract Snippets
+
+A **Fungible Token contract** might implement:
+
+```rust
+#[near_bindgen]
+impl FungibleTokenContract {
+    #[payable]
+    pub fn storage_deposit(&mut self, account_id: Option<AccountId>) {
+        let id = account_id.unwrap_or(env::predecessor_account_id());
+        assert!(
+            self.accounts.insert(&id, &0u128).is_none(),
+            "Already registered"
+        );
+    }
+
+    #[payable]
+    pub fn ft_transfer(&mut self, receiver_id: AccountId, amount: U128) {
+        assert_one_yocto();
+        let sender_id = env::predecessor_account_id();
+        self.internal_transfer(&sender_id, &receiver_id, amount.into());
+    }
+}
+```
+
+A **Guest Book contract** might implement:
+
+```rust
+#[near_bindgen]
+impl GuestBook {
+    #[payable]
+    pub fn add_message(&mut self, text: String) {
+        let sender = env::predecessor_account_id();
+        self.messages.push(Message { sender, text });
+    }
+}
+```
+
+---
+
+## Note
+
+* **Multiple view calls** → query many contracts quickly in parallel.
+* **Batch actions** → atomic operations on the same contract.
+* **Multiple transactions in one wallet prompt** → independent execution across contracts.
+* **Storage staking** → always check `storage_balance_of` and attach the required deposit.
+
+---
+
+
